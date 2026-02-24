@@ -24,6 +24,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 EXT_LANGUAGE = {
+    ".md": "markdown",
+    ".yaml": "yaml",
+    ".yml": "yaml",
     ".py": "python",
     ".js": "javascript",
     ".jsx": "javascript",
@@ -246,6 +249,18 @@ def extract_default(text: str) -> tuple[list[str], list[str]]:
     return defs, []
 
 
+def extract_markdown(text: str) -> tuple[list[str], list[str]]:
+    headings = re.findall(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", text, flags=re.MULTILINE)
+    defs = []
+    for h in headings:
+        cleaned = re.sub(r"[^A-Za-z0-9_ ]+", " ", h).strip()
+        if cleaned:
+            defs.append(cleaned.replace(" ", "_")[:64])
+    links = re.findall(r"\[[^\]]+\]\(([^)]+)\)", text)
+    refs = [link for link in links if not link.startswith("http://") and not link.startswith("https://")]
+    return dedupe(defs), dedupe(refs)
+
+
 def parse_file(path: Path, rel_path: str) -> FileInfo:
     text = read_text(path)
     language = EXT_LANGUAGE.get(path.suffix.lower(), "unknown")
@@ -259,6 +274,8 @@ def parse_file(path: Path, rel_path: str) -> FileInfo:
         defs, imports = extract_go(text)
     elif language == "rust":
         defs, imports = extract_rust(text)
+    elif language == "markdown":
+        defs, imports = extract_markdown(text)
     else:
         defs, imports = extract_default(text)
 
