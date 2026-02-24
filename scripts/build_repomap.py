@@ -455,17 +455,16 @@ def extract_symbol_snippets(text: str, language: str, definitions: list[str]) ->
         if line_index < 0:
             continue
 
-        capture: list[str] = []
-        if language == "python" and line_index > 0 and lines[line_index - 1].lstrip().startswith("@"):
-            capture.append(_trim_code_line(lines[line_index - 1].strip()))
-
-        capture.append(_trim_code_line(lines[line_index].strip()))
+        capture: list[str] = [_trim_code_line(lines[line_index].strip())]
         probe = line_index + 1
-        while len(capture) < 2 and probe < len(lines):
+        while probe < len(lines):
             candidate = lines[probe].strip()
-            if candidate:
-                capture.append(_trim_code_line(candidate))
             probe += 1
+            if not candidate:
+                continue
+            if re.match(r"^return\b", candidate):
+                capture.append(_trim_code_line(candidate))
+            break
         snippets[symbol] = capture[:2]
 
     return snippets
@@ -674,10 +673,12 @@ def pagerank(edges: dict[str, Counter[str]], damping: float = 0.85, iterations: 
 def build_dir_summary(ranked_paths: list[str], depth: int = 2) -> list[tuple[str, int]]:
     buckets: dict[str, int] = defaultdict(int)
     for path in ranked_paths[:200]:
-        parts = Path(path).parts
-        if not parts:
-            continue
-        bucket = "/".join(parts[: min(depth, len(parts))])
+        path_obj = Path(path)
+        parent_parts = path_obj.parent.parts
+        if parent_parts:
+            bucket = "/".join(parent_parts[: min(depth, len(parent_parts))])
+        else:
+            bucket = path_obj.name
         buckets[bucket] += 1
     return sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))[:12]
 

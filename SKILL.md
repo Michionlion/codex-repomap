@@ -46,7 +46,7 @@ sed -n '1,240p' .codex/repomap.txt
 - Keep the output compact and ranked.
 - Include:
   - Repo metadata (scan size, languages, dominant directories)
-  - Ranked file list with key symbols plus 1-2 code lines per symbol
+  - Ranked file list with key symbols plus definition line (and next line only if it is a `return` statement)
   - Dependency/reference edges summary
 
 ## Notes
