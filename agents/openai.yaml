@@ -1,0 +1,4 @@
+interface:
+  display_name: "RepoMap"
+  short_description: "Build compact repository maps for AI context"
+  default_prompt: "Use $repomap to regenerate a compact repository map for this repo and summarize the architecture."
