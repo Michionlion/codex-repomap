@@ -18,6 +18,7 @@ import keyword
 import re
 import subprocess
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -97,8 +98,8 @@ COMMON_SYMBOLS = set(keyword.kwlist) | {
 class FileInfo:
     path: str
     language: str
-    lines: int
     definitions: list[str]
+    symbol_snippets: dict[str, list[str]]
     imports: list[str]
     tokens: set[str]
 
@@ -130,7 +131,8 @@ def list_files(root: Path, include_hidden: bool) -> list[str]:
         if suffix not in EXT_LANGUAGE:
             continue
         filtered.append(rel)
-    return sorted(set(filtered))
+    filtered = sorted(set(filtered))
+    return apply_gitignore_filters(root, filtered)
 
 
 def is_test_path(path: str) -> bool:
@@ -160,6 +162,149 @@ def dedupe(items: list[str]) -> list[str]:
             out.append(item)
             seen.add(item)
     return out
+
+
+def apply_gitignore_filters(root: Path, candidates: list[str]) -> list[str]:
+    if not candidates:
+        return candidates
+
+    filtered = _filter_with_git_check_ignore(root, candidates)
+    if filtered is not None:
+        return filtered
+    filtered = _filter_with_ephemeral_git_check_ignore(root, candidates)
+    if filtered is not None:
+        return filtered
+    return _filter_with_discovered_gitignores(root, candidates)
+
+
+def _filter_with_git_check_ignore(root: Path, candidates: list[str]) -> list[str] | None:
+    cmd = ["git", "-C", str(root), "check-ignore", "--stdin"]
+    payload = "\n".join(candidates) + "\n"
+    try:
+        proc = subprocess.run(cmd, input=payload, text=True, capture_output=True)
+    except FileNotFoundError:
+        return None
+
+    if proc.returncode not in (0, 1):
+        return None
+
+    ignored = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    if not ignored:
+        return candidates
+    return [path for path in candidates if path not in ignored]
+
+
+def _filter_with_ephemeral_git_check_ignore(root: Path, candidates: list[str]) -> list[str] | None:
+    try:
+        with tempfile.TemporaryDirectory(prefix="repomap-ignore-") as temp_dir:
+            init = subprocess.run(
+                ["git", "-C", temp_dir, "init", "--quiet"],
+                capture_output=True,
+                text=True,
+            )
+            if init.returncode != 0:
+                return None
+
+            payload = "\n".join(candidates) + "\n"
+            proc = subprocess.run(
+                [
+                    "git",
+                    f"--git-dir={temp_dir}/.git",
+                    f"--work-tree={root}",
+                    "check-ignore",
+                    "--no-index",
+                    "--stdin",
+                ],
+                input=payload,
+                text=True,
+                capture_output=True,
+            )
+    except (FileNotFoundError, OSError):
+        return None
+
+    if proc.returncode not in (0, 1):
+        return None
+
+    ignored = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    if not ignored:
+        return candidates
+    return [path for path in candidates if path not in ignored]
+
+
+def _filter_with_discovered_gitignores(root: Path, candidates: list[str]) -> list[str]:
+    rules: list[tuple[str, str, bool]] = []
+    gitignores = sorted(
+        root.rglob(".gitignore"),
+        key=lambda p: (len(p.relative_to(root).parts), p.relative_to(root).as_posix()),
+    )
+
+    for gitignore in gitignores:
+        try:
+            rel_base = gitignore.parent.relative_to(root).as_posix()
+            if rel_base == ".":
+                rel_base = ""
+            content = gitignore.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            negated = line.startswith("!")
+            pattern = line[1:] if negated else line
+            pattern = pattern.strip()
+            if pattern:
+                rules.append((rel_base, pattern, negated))
+
+    if not rules:
+        return candidates
+
+    kept: list[str] = []
+    for rel_path in candidates:
+        ignored = False
+        for base, pattern, negated in rules:
+            if _matches_gitignore_rule(rel_path, base, pattern):
+                ignored = not negated
+        if not ignored:
+            kept.append(rel_path)
+    return kept
+
+
+def _matches_gitignore_rule(rel_path: str, base: str, pattern: str) -> bool:
+    # Normalize to POSIX-like relative paths.
+    if base and rel_path != base and not rel_path.startswith(base + "/"):
+        return False
+
+    subpath = rel_path[len(base) + 1 :] if base else rel_path
+    if not subpath:
+        return False
+
+    directory_only = pattern.endswith("/")
+    anchored = pattern.startswith("/")
+    clean = pattern.strip("/")
+    if not clean:
+        return False
+
+    if directory_only:
+        if "/" in clean:
+            if anchored:
+                return subpath == clean or subpath.startswith(clean + "/")
+            return subpath == clean or subpath.startswith(clean + "/") or f"/{clean}/" in f"/{subpath}/"
+        return subpath == clean or subpath.startswith(clean + "/") or f"/{clean}/" in f"/{subpath}/"
+
+    if "/" in clean:
+        if anchored:
+            return _path_match(subpath, clean)
+        return _path_match(subpath, clean) or _path_match(subpath, f"*/{clean}")
+
+    return any(_path_match(part, clean) for part in subpath.split("/"))
+
+
+def _path_match(path: str, pattern: str) -> bool:
+    # Gitignore-style wildcard matching for fallback mode.
+    regex = re.escape(pattern).replace(r"\*\*", ".*").replace(r"\*", "[^/]*").replace(r"\?", "[^/]")
+    return re.fullmatch(regex, path) is not None
 
 
 def extract_python(text: str) -> tuple[list[str], list[str]]:
@@ -261,10 +406,74 @@ def extract_markdown(text: str) -> tuple[list[str], list[str]]:
     return dedupe(defs), dedupe(refs)
 
 
+def _definition_patterns(language: str, symbol: str) -> list[re.Pattern[str]]:
+    escaped = re.escape(symbol)
+    if language == "python":
+        return [re.compile(rf"^\s*(?:async\s+def|def|class)\s+{escaped}\b")]
+    if language in {"javascript", "typescript"}:
+        return [
+            re.compile(rf"^\s*(?:export\s+)?(?:async\s+)?function\s+{escaped}\b"),
+            re.compile(rf"^\s*(?:export\s+)?class\s+{escaped}\b"),
+            re.compile(rf"^\s*(?:export\s+)?(?:const|let|var|type|interface)\s+{escaped}\b"),
+        ]
+    if language == "go":
+        return [
+            re.compile(rf"^\s*func\s+(?:\([^)]+\)\s*)?{escaped}\b"),
+            re.compile(rf"^\s*(?:type|var|const)\s+{escaped}\b"),
+        ]
+    if language == "rust":
+        return [
+            re.compile(rf"^\s*(?:pub\s+)?(?:fn|struct|enum|trait|mod)\s+{escaped}\b"),
+            re.compile(rf"^\s*impl\s+{escaped}\b"),
+        ]
+    if language == "markdown":
+        heading = re.escape(symbol.replace("_", " "))
+        return [re.compile(rf"^\s{{0,3}}#{{1,6}}\s+{heading}\s*$", re.IGNORECASE)]
+    return [re.compile(rf"\b{escaped}\b")]
+
+
+def _trim_code_line(value: str, max_len: int = 140) -> str:
+    line = value.rstrip()
+    if len(line) <= max_len:
+        return line
+    return line[: max_len - 3] + "..."
+
+
+def extract_symbol_snippets(text: str, language: str, definitions: list[str]) -> dict[str, list[str]]:
+    lines = text.splitlines()
+    snippets: dict[str, list[str]] = {}
+    if not lines or not definitions:
+        return snippets
+
+    for symbol in definitions:
+        patterns = _definition_patterns(language, symbol)
+        line_index = -1
+        for idx, raw in enumerate(lines):
+            if any(pattern.search(raw) for pattern in patterns):
+                line_index = idx
+                break
+        if line_index < 0:
+            continue
+
+        capture: list[str] = []
+        if language == "python" and line_index > 0 and lines[line_index - 1].lstrip().startswith("@"):
+            capture.append(_trim_code_line(lines[line_index - 1].strip()))
+
+        capture.append(_trim_code_line(lines[line_index].strip()))
+        probe = line_index + 1
+        while len(capture) < 2 and probe < len(lines):
+            candidate = lines[probe].strip()
+            if candidate:
+                capture.append(_trim_code_line(candidate))
+            probe += 1
+        snippets[symbol] = capture[:2]
+
+    return snippets
+
+
 def parse_file(path: Path, rel_path: str) -> FileInfo:
     text = read_text(path)
     language = EXT_LANGUAGE.get(path.suffix.lower(), "unknown")
-    lines = text.count("\n") + (1 if text else 0)
 
     if language == "python":
         defs, imports = extract_python(text)
@@ -279,6 +488,7 @@ def parse_file(path: Path, rel_path: str) -> FileInfo:
     else:
         defs, imports = extract_default(text)
 
+    symbol_snippets = extract_symbol_snippets(text, language, defs)
     tokens = {w for w in WORD_RE.findall(text) if w.lower() not in COMMON_SYMBOLS}
     if len(tokens) > 6000:
         tokens = set(sorted(tokens)[:6000])
@@ -286,8 +496,8 @@ def parse_file(path: Path, rel_path: str) -> FileInfo:
     return FileInfo(
         path=rel_path,
         language=language,
-        lines=lines,
         definitions=defs,
+        symbol_snippets=symbol_snippets,
         imports=imports,
         tokens=tokens,
     )
@@ -461,14 +671,14 @@ def pagerank(edges: dict[str, Counter[str]], damping: float = 0.85, iterations: 
     return rank
 
 
-def build_dir_summary(ranked_paths: list[str], ranks: dict[str, float], depth: int = 2) -> list[tuple[str, float]]:
-    buckets: dict[str, float] = defaultdict(float)
+def build_dir_summary(ranked_paths: list[str], depth: int = 2) -> list[tuple[str, int]]:
+    buckets: dict[str, int] = defaultdict(int)
     for path in ranked_paths[:200]:
         parts = Path(path).parts
         if not parts:
             continue
         bucket = "/".join(parts[: min(depth, len(parts))])
-        buckets[bucket] += ranks.get(path, 0.0)
+        buckets[bucket] += 1
     return sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))[:12]
 
 
@@ -483,7 +693,7 @@ def format_map(
 ) -> str:
     ranked_paths = sorted(files.keys(), key=lambda p: (-ranks.get(p, 0.0), p))
     language_counts = Counter(info.language for info in files.values())
-    dir_summary = build_dir_summary(ranked_paths, ranks)
+    dir_summary = build_dir_summary(ranked_paths)
 
     lines: list[str] = []
     lines.append(f"# RepoMap: {root.name}")
@@ -492,21 +702,25 @@ def format_map(
     langs = ", ".join(f"{k}:{v}" for k, v in sorted(language_counts.items(), key=lambda kv: (-kv[1], kv[0])))
     lines.append(f"languages: {langs}")
     if dir_summary:
-        lines.append("top_dirs: " + ", ".join(f"{d}({score:.3f})" for d, score in dir_summary))
+        lines.append("top_dirs: " + ", ".join(f"{d}({count})" for d, count in dir_summary))
     edge_count = sum(len(v) for v in edges.values())
     lines.append(f"graph_edges: {edge_count}")
     lines.append("")
     lines.append("## Ranked files")
 
-    for path in ranked_paths[:max_files]:
+    for rank_index, path in enumerate(ranked_paths[:max_files], start=1):
         info = files[path]
-        score = ranks.get(path, 0.0)
         defs = dedupe(info.definitions)[:max_symbols]
         import_preview = dedupe(info.imports)[:4]
 
-        block = [f"{path} [{info.language}] score={score:.5f} lines={info.lines}"]
+        block = [f"{rank_index}. {path} [{info.language}]"]
         if defs:
-            block.append("  defs: " + ", ".join(defs))
+            block.append("  symbols:")
+            for symbol in defs:
+                snippet = info.symbol_snippets.get(symbol, [])
+                block.append(f"    - {symbol}")
+                for line in snippet[:2]:
+                    block.append(f"      | {line}")
         if import_preview:
             block.append("  imports: " + ", ".join(import_preview))
 

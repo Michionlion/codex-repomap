@@ -31,6 +31,7 @@ sed -n '1,240p' .codex/repomap.txt
 - Start with the top-ranked files.
 - Expand only the files/directories relevant to the user request.
 - Regenerate the map after major structural changes.
+- Trust that ignored files are excluded using `.gitignore` rules when present.
 
 ## Tuning
 
@@ -45,7 +46,7 @@ sed -n '1,240p' .codex/repomap.txt
 - Keep the output compact and ranked.
 - Include:
   - Repo metadata (scan size, languages, dominant directories)
-  - Ranked file list with key symbols
+  - Ranked file list with key symbols plus 1-2 code lines per symbol
   - Dependency/reference edges summary
 
 ## Notes
